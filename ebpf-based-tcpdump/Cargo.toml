@@ -1,0 +1,6 @@
+[package]
+name = "ebpf-based-tcpdump"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
