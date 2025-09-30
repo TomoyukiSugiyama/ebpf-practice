@@ -21,7 +21,7 @@ multipass transfer target/aarch64-unknown-linux-musl/release/tcpdump ubuntu-2404
 
 ## Start the tcpdump binary in a virtual machine
 ```
-% multipass exec ubuntu-2404 -- bash -c 'sudo ./tcpdump'                    (git)-[main]
+% multipass exec ubuntu-2404 -- bash -c 'sudo ./tcpdump'
 Waiting for Ctrl-C...
 
 or
