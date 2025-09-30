@@ -1,0 +1,17 @@
+[package]
+name = "tcpdump-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+tcpdump-common = { path = "../tcpdump-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "tcpdump"
+path = "src/main.rs"
