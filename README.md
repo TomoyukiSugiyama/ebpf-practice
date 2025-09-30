@@ -1,9 +1,5 @@
 ## Cross-compiling on macOS
-```
-CC=aarch64-linux-musl-gcc cargo build --package tcpdump --release \
-  --target=aarch64-unknown-linux-musl \
-  --config=target.aarch64-unknown-linux-musl.linker=\"aarch64-linux-musl-gcc\"
-```
+See `tcpdump/README.md` for cross-compiling setup and build instructions. Following those steps, you can build the `tcpdump` binary for the `aarch64-unknown-linux-musl` target.
 
 ## Create a VM for Ubuntu
 It is necessary to install Multipass. Please follow the official documentation for detailed installation instructions, making sure to select the appropriate procedure for your operating system. Administrator privileges may be required for installation.
