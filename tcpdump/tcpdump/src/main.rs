@@ -1,7 +1,7 @@
 use std::{
     ptr,
     sync::{
-        Arc,
+        Arc, Once,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -20,13 +20,10 @@ use tokio::{signal, task};
 const EVENT_SIZE: usize = core::mem::size_of::<TcpEvent>();
 const BUFFER_COUNT: usize = 4;
 
-fn log_event(cpu_id: u32, bytes: &BytesMut) {
+#[inline]
+fn parse_event(bytes: &BytesMut) -> Option<TcpEvent> {
     if bytes.len() < EVENT_SIZE {
-        warn!(
-            "malformed perf event; expected {EVENT_SIZE} bytes, got {}",
-            bytes.len()
-        );
-        return;
+        return None;
     }
 
     let mut event = TcpEvent {
@@ -45,15 +42,35 @@ fn log_event(cpu_id: u32, bytes: &BytesMut) {
         );
     }
 
-    info!(
-        "cpu={} tcp_connect pid={} tgid={} comm={} src_ip={} dst_ip={}",
-        cpu_id,
-        event.pid,
-        event.tgid,
-        event.command(),
-        event.src_addr(),
-        event.dst_addr()
-    );
+    Some(event)
+}
+
+fn log_event(cpu_id: u32, bytes: &BytesMut) {
+    static PRINT_HEADER: Once = Once::new();
+
+    match parse_event(bytes) {
+        Some(event) => {
+            PRINT_HEADER.call_once(|| {
+                info!(
+                    "{:<3} {:<7} {:<7} {:<16} {:<15} {:<15}",
+                    "CPU", "PID", "TGID", "COMM", "SRC", "DST"
+                );
+            });
+            info!(
+                "{:<3} {:<7} {:<7} {:<16} {:<15} {:<15}",
+                cpu_id,
+                event.pid,
+                event.tgid,
+                event.command(),
+                event.src_addr(),
+                event.dst_addr()
+            );
+        }
+        None => warn!(
+            "malformed perf event; expected {EVENT_SIZE} bytes, got {}",
+            bytes.len()
+        ),
+    }
 }
 
 #[tokio::main]
