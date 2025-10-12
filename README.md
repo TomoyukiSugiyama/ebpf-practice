@@ -33,13 +33,13 @@ Copies the built `tcpdump` binary from your host into the VM user's home directo
 
 ## Start the tcpdump binary in a virtual machine
 ```
-% multipass exec ubuntu-2404 -- bash -c 'sudo ./tcpdump'
+% multipass exec ubuntu-2404 -- bash -c 'sudo RUST_LOG=info ./tcpdump'
 Waiting for Ctrl-C...
 
 or
 
 % multipass shell ubuntu-2404
-ubuntu@ubuntu-2404:~$ sudo ./tcpdump 
+ubuntu@ubuntu-2404:~$ sudo RUST_LOG=info ./tcpdump
 Waiting for Ctrl-C...
 
 ```
