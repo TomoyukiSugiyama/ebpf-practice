@@ -1,17 +1,60 @@
 use std::{
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
 
-use aya::maps::perf::{PerfBufferError, PerfEventArrayBuffer};
 use aya::maps::PerfEventArray;
+use aya::maps::perf::{PerfBufferError, PerfEventArrayBuffer};
 use aya::programs::KProbe;
 use aya::util::online_cpus;
 use bytes::BytesMut;
 use log::{debug, info, warn};
 use tcpdump_common::TcpEvent;
 use tokio::{signal, task};
+
+const EVENT_SIZE: usize = core::mem::size_of::<TcpEvent>();
+const BUFFER_COUNT: usize = 4;
+
+fn log_event(cpu_id: u32, bytes: &BytesMut) {
+    if bytes.len() < EVENT_SIZE {
+        warn!(
+            "malformed perf event; expected {EVENT_SIZE} bytes, got {}",
+            bytes.len()
+        );
+        return;
+    }
+
+    let mut event = TcpEvent {
+        pid: 0,
+        tgid: 0,
+        comm: [0; 16],
+        src_ip: 0,
+        dst_ip: 0,
+    };
+
+    unsafe {
+        ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            &mut event as *mut TcpEvent as *mut u8,
+            EVENT_SIZE,
+        );
+    }
+
+    info!(
+        "cpu={} tcp_connect pid={} tgid={} comm={} src_ip={} dst_ip={}",
+        cpu_id,
+        event.pid,
+        event.tgid,
+        event.command(),
+        event.src_addr(),
+        event.dst_addr()
+    );
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,7 +83,10 @@ async fn main() -> anyhow::Result<()> {
         warn!("aya-log disabled: {e}");
     }
 
-    let mut events = PerfEventArray::try_from(ebpf.take_map("EVENTS").ok_or_else(|| anyhow::anyhow!("EVENTS map missing"))?)?;
+    let mut events = PerfEventArray::try_from(
+        ebpf.take_map("EVENTS")
+            .ok_or_else(|| anyhow::anyhow!("EVENTS map missing"))?,
+    )?;
     let mut perf_buffers: Vec<(u32, PerfEventArrayBuffer<_>)> = online_cpus()
         .map_err(|(_, error)| error)?
         .into_iter()
@@ -52,7 +98,8 @@ async fn main() -> anyhow::Result<()> {
     for (cpu_id, mut buf) in perf_buffers.drain(..) {
         let running = running.clone();
         handles.push(task::spawn_blocking(move || {
-            let mut buffers = [BytesMut::with_capacity(core::mem::size_of::<TcpEvent>())];
+            let mut buffers: [BytesMut; BUFFER_COUNT] =
+                core::array::from_fn(|_| BytesMut::with_capacity(EVENT_SIZE));
             loop {
                 if !running.load(Ordering::Relaxed) {
                     break;
@@ -60,24 +107,12 @@ async fn main() -> anyhow::Result<()> {
                 match buf.read_events(&mut buffers) {
                     Ok(events) => {
                         if events.read > 0 {
-                            for bytes in buffers.iter().filter(|b| !b.is_empty()) {
-                                if bytes.len() >= core::mem::size_of::<TcpEvent>() {
-                                    let evt = unsafe { *(bytes.as_ptr() as *const TcpEvent) };
-                                    info!(
-                                        "cpu={} tcp_connect pid={} tgid={} comm={} src_ip={} dst_ip={}",
-                                        cpu_id,
-                                        evt.pid,
-                                        evt.tgid,
-                                        evt.command(),
-                                        evt.src_addr(),
-                                        evt.dst_addr()
-                                    );
-                                }
-                            }
+                            buffers
+                                .iter()
+                                .filter(|buf| !buf.is_empty())
+                                .for_each(|buf| log_event(cpu_id, buf));
                         }
-                        for buf in &mut buffers {
-                            buf.clear();
-                        }
+                        buffers.iter_mut().for_each(|buf| buf.clear());
                         if events.read == 0 {
                             thread::sleep(Duration::from_millis(10));
                         }

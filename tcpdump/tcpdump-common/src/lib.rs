@@ -25,9 +25,9 @@ pub mod ebpf {
 
 #[cfg(feature = "user")]
 pub mod user {
+    use super::TcpEvent;
     use aya::Pod;
     use std::net::Ipv4Addr;
-    use super::TcpEvent;
     unsafe impl Pod for TcpEvent {}
 
     impl TcpEvent {

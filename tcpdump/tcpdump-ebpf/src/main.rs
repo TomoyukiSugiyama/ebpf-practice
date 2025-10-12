@@ -6,7 +6,7 @@ use aya_ebpf::{
     macros::kprobe,
     programs::ProbeContext,
 };
-use tcpdump_common::{ebpf, TcpEvent};
+use tcpdump_common::{TcpEvent, ebpf};
 
 #[kprobe]
 pub fn tcpdump(ctx: ProbeContext) -> u32 {
