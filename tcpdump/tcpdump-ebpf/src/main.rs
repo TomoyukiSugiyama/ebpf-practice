@@ -2,12 +2,11 @@
 #![no_main]
 
 use aya_ebpf::{
-    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid},
+    helpers::{bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_probe_read_kernel},
     macros::kprobe,
     programs::ProbeContext,
 };
-use aya_log_ebpf::info;
-use core::str;
+use tcpdump_common::{ebpf, TcpEvent};
 
 #[kprobe]
 pub fn tcpdump(ctx: ProbeContext) -> u32 {
@@ -22,36 +21,33 @@ fn try_tcpdump(ctx: ProbeContext) -> Result<u32, u32> {
     let pid = (pid_tgid & 0xffff_ffff) as u32;
     let tgid = (pid_tgid >> 32) as u32;
 
-    let mut comm_buf = [0u8; 16];
-    let mut comm_valid = false;
-    if let Ok(buf) = bpf_get_current_comm() {
-        comm_buf = buf;
-        comm_valid = true;
-    }
-
-    let mut len = 0usize;
-    while len < comm_buf.len() {
-        if comm_buf[len] == 0 {
-            break;
-        }
-        len += 1;
-    }
-
-    let comm_str = if !comm_valid {
-        "<unknown>"
-    } else if len == 0 {
-        "<empty>"
-    } else {
-        unsafe { str::from_utf8_unchecked(&comm_buf[..len]) }
-    };
-
-    info!(
-        &ctx,
-        "tcp_connect pid={} tgid={} comm={}",
+    let mut event = TcpEvent {
         pid,
         tgid,
-        comm_str
-    );
+        comm: [0; 16],
+        src_ip: 0,
+        dst_ip: 0,
+    };
+
+    if let Ok(comm) = bpf_get_current_comm() {
+        event.comm = comm;
+    }
+
+    let sock_ptr = ctx.arg::<usize>(0).ok_or(1u32)? as *const u8;
+    if !sock_ptr.is_null() {
+        const SKC_RCV_SADDR_OFFSET: usize = 0x1C;
+        const SKC_DADDR_OFFSET: usize = 0x20;
+        unsafe {
+            event.src_ip = bpf_probe_read_kernel(sock_ptr.add(SKC_RCV_SADDR_OFFSET) as *const u32)
+                .map_err(|_| 1u32)?;
+            event.dst_ip = bpf_probe_read_kernel(sock_ptr.add(SKC_DADDR_OFFSET) as *const u32)
+                .map_err(|_| 1u32)?;
+        }
+    }
+
+    unsafe {
+        (*ebpf::events_map()).output(&ctx, &event, 0);
+    }
     Ok(0)
 }
 

@@ -1,7 +1,17 @@
+use std::{
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    thread,
+    time::Duration,
+};
+
+use aya::maps::perf::{PerfBufferError, PerfEventArrayBuffer};
+use aya::maps::PerfEventArray;
 use aya::programs::KProbe;
-#[rustfmt::skip]
-use log::{debug, warn};
-use tokio::signal;
+use aya::util::online_cpus;
+use bytes::BytesMut;
+use log::{debug, info, warn};
+use tcpdump_common::TcpEvent;
+use tokio::{signal, task};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,23 +36,62 @@ async fn main() -> anyhow::Result<()> {
         env!("OUT_DIR"),
         "/tcpdump"
     )))?;
-    match aya_log::EbpfLogger::init(&mut ebpf) {
-        Err(e) => {
-            // This can happen if you remove all log statements from your eBPF program.
-            warn!("failed to initialize eBPF logger: {e}");
-        }
-        Ok(logger) => {
-            let mut logger =
-                tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
-            tokio::task::spawn(async move {
-                loop {
-                    let mut guard = logger.readable_mut().await.unwrap();
-                    guard.get_inner_mut().flush();
-                    guard.clear_ready();
-                }
-            });
-        }
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
+        warn!("aya-log disabled: {e}");
     }
+
+    let mut events = PerfEventArray::try_from(ebpf.take_map("EVENTS").ok_or_else(|| anyhow::anyhow!("EVENTS map missing"))?)?;
+    let mut perf_buffers: Vec<(u32, PerfEventArrayBuffer<_>)> = online_cpus()
+        .map_err(|(_, error)| error)?
+        .into_iter()
+        .map(|cpu_id| events.open(cpu_id, None).map(|buf| (cpu_id, buf)))
+        .collect::<Result<_, _>>()?;
+
+    let running = Arc::new(AtomicBool::new(true));
+    let mut handles = Vec::new();
+    for (cpu_id, mut buf) in perf_buffers.drain(..) {
+        let running = running.clone();
+        handles.push(task::spawn_blocking(move || {
+            let mut buffers = [BytesMut::with_capacity(core::mem::size_of::<TcpEvent>())];
+            loop {
+                if !running.load(Ordering::Relaxed) {
+                    break;
+                }
+                match buf.read_events(&mut buffers) {
+                    Ok(events) => {
+                        if events.read > 0 {
+                            for bytes in buffers.iter().filter(|b| !b.is_empty()) {
+                                if bytes.len() >= core::mem::size_of::<TcpEvent>() {
+                                    let evt = unsafe { *(bytes.as_ptr() as *const TcpEvent) };
+                                    info!(
+                                        "cpu={} tcp_connect pid={} tgid={} comm={} src_ip={} dst_ip={}",
+                                        cpu_id,
+                                        evt.pid,
+                                        evt.tgid,
+                                        evt.command(),
+                                        evt.src_addr(),
+                                        evt.dst_addr()
+                                    );
+                                }
+                            }
+                        }
+                        for buf in &mut buffers {
+                            buf.clear();
+                        }
+                        if events.read == 0 {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                    Err(PerfBufferError::NoBuffers) => {
+                        warn!("perf buffer returned no buffers");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => warn!("failed to read perf event on cpu {cpu_id}: {e}"),
+                }
+            }
+        }));
+    }
+
     let program: &mut KProbe = ebpf.program_mut("tcpdump").unwrap().try_into()?;
     program.load()?;
     program.attach("tcp_connect", 0)?;
@@ -51,6 +100,13 @@ async fn main() -> anyhow::Result<()> {
     println!("Waiting for Ctrl-C...");
     ctrl_c.await?;
     println!("Exiting...");
+
+    running.store(false, Ordering::Relaxed);
+    for handle in handles {
+        if let Err(e) = handle.await {
+            warn!("failed to join reader task: {e}");
+        }
+    }
 
     Ok(())
 }

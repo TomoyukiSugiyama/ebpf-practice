@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-tcpdump-common = { path = "../tcpdump-common" }
+tcpdump-common = { path = "../tcpdump-common", features = ["ebpf"], default-features = false }
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }

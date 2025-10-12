@@ -586,6 +586,7 @@ dependencies = [
  "aya",
  "aya-build",
  "aya-log",
+ "bytes",
  "env_logger",
  "libc",
  "log",
@@ -599,6 +600,7 @@ name = "tcpdump-common"
 version = "0.1.0"
 dependencies = [
  "aya",
+ "aya-ebpf",
 ]
 
 [[package]]
