@@ -22,6 +22,58 @@ const TCP_SYN_RECV: i32 = 3;
 const TCP_LISTEN: i32 = 10;
 const TCP_NEW_SYN_RECV: i32 = 12;
 
+fn current_pid_tgid() -> (u32, u32) {
+    let pid_tgid = bpf_get_current_pid_tgid();
+    ((pid_tgid & 0xffff_ffff) as u32, (pid_tgid >> 32) as u32)
+}
+
+fn init_event(pid: u32, tgid: u32) -> TcpEvent {
+    let mut event = TcpEvent::default();
+    event.pid = pid;
+    event.tgid = tgid;
+    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
+    event
+}
+
+fn populate_comm(event: &mut TcpEvent) {
+    if let Ok(comm) = bpf_get_current_comm() {
+        event.comm = comm;
+    }
+}
+
+fn load_probe_args(ctx: &ProbeContext) -> Result<(*const sock, i32), u32> {
+    let sock_ptr = ctx.arg::<usize>(0).ok_or(1u32)? as *const sock;
+    let state = ctx.arg::<i32>(1).ok_or(1u32)?;
+    Ok((sock_ptr, state))
+}
+
+fn state_tracked(state: i32) -> bool {
+    state >= TCP_ESTABLISHED && state <= TCP_NEW_SYN_RECV
+}
+
+fn populate_socket_fields(sock_ptr: *const sock, event: &mut TcpEvent) -> Result<bool, u32> {
+    unsafe {
+        let common = bpf_probe_read_kernel(core::ptr::addr_of!((*sock_ptr).__sk_common))
+            .map_err(|_| 1u32)?;
+        if common.skc_family as u16 != AF_INET {
+            return Ok(false);
+        }
+        let v4 = common.__bindgen_anon_1.__bindgen_anon_1;
+        event.src_ip = u32::from_be(v4.skc_rcv_saddr as u32);
+        event.dst_ip = u32::from_be(v4.skc_daddr as u32);
+        let ports = common.__bindgen_anon_3.__bindgen_anon_1;
+        event.src_port = ports.skc_num;
+        event.dst_port = u16::from_be(ports.skc_dport as u16);
+    }
+    Ok(true)
+}
+
+fn submit_event(ctx: &ProbeContext, event: &TcpEvent) {
+    unsafe {
+        (*ebpf::events_map()).output(ctx, event, 0);
+    }
+}
+
 fn infer_direction(state: i32, src_port: u16, dst_port: u16) -> u8 {
     if state == TCP_SYN_SENT {
         return TCP_DIRECTION_OUTGOING;
@@ -57,50 +109,23 @@ pub fn tcpdump(ctx: ProbeContext) -> u32 {
 }
 
 fn try_tcpdump(ctx: ProbeContext) -> Result<u32, u32> {
-    let pid_tgid = bpf_get_current_pid_tgid();
-    let pid = (pid_tgid & 0xffff_ffff) as u32;
-    let tgid = (pid_tgid >> 32) as u32;
+    let (pid, tgid) = current_pid_tgid();
+    let mut event = init_event(pid, tgid);
+    populate_comm(&mut event);
 
-    let mut event = TcpEvent::default();
-    event.pid = pid;
-    event.tgid = tgid;
-    event.timestamp_ns = unsafe { bpf_ktime_get_ns() };
-
-    if let Ok(comm) = bpf_get_current_comm() {
-        event.comm = comm;
-    }
-
-    let sock_ptr = ctx.arg::<usize>(0).ok_or(1u32)? as *const sock;
-    let state = ctx.arg::<i32>(1).ok_or(1u32)?;
+    let (sock_ptr, state) = load_probe_args(&ctx)?;
     event.state = state as u32;
 
-    if sock_ptr.is_null() {
+    if sock_ptr.is_null() || !state_tracked(state) {
         return Ok(0);
     }
 
-    if state < TCP_ESTABLISHED || state > TCP_NEW_SYN_RECV {
+    if !populate_socket_fields(sock_ptr, &mut event)? {
         return Ok(0);
-    }
-
-    unsafe {
-        let common = bpf_probe_read_kernel(core::ptr::addr_of!((*sock_ptr).__sk_common))
-            .map_err(|_| 1u32)?;
-        if common.skc_family as u16 != AF_INET {
-            return Ok(0);
-        }
-        let v4 = common.__bindgen_anon_1.__bindgen_anon_1;
-        event.src_ip = u32::from_be(v4.skc_rcv_saddr as u32);
-        event.dst_ip = u32::from_be(v4.skc_daddr as u32);
-        let ports = common.__bindgen_anon_3.__bindgen_anon_1;
-        event.src_port = ports.skc_num;
-        event.dst_port = u16::from_be(ports.skc_dport as u16);
     }
 
     event.direction = infer_direction(state, event.src_port, event.dst_port);
-
-    unsafe {
-        (*ebpf::events_map()).output(&ctx, &event, 0);
-    }
+    submit_event(&ctx, &event);
     Ok(0)
 }
 
