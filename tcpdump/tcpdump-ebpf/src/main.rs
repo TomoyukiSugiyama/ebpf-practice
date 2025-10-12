@@ -19,6 +19,33 @@ const AF_INET: u16 = 2;
 const TCP_ESTABLISHED: i32 = 1;
 const TCP_SYN_SENT: i32 = 2;
 const TCP_SYN_RECV: i32 = 3;
+const TCP_LISTEN: i32 = 10;
+
+fn infer_direction(state: i32, src_port: u16, dst_port: u16) -> u8 {
+    if state == TCP_SYN_SENT {
+        return TCP_DIRECTION_OUTGOING;
+    }
+    if state == TCP_SYN_RECV || state == TCP_LISTEN {
+        return TCP_DIRECTION_INCOMING;
+    }
+
+    if src_port == 0 && dst_port != 0 {
+        return TCP_DIRECTION_OUTGOING;
+    }
+    if dst_port == 0 && src_port != 0 {
+        return TCP_DIRECTION_INCOMING;
+    }
+
+    let lower_ephemeral = 1024u16;
+    if src_port >= lower_ephemeral && dst_port < lower_ephemeral {
+        return TCP_DIRECTION_OUTGOING;
+    }
+    if src_port < lower_ephemeral && dst_port >= lower_ephemeral {
+        return TCP_DIRECTION_INCOMING;
+    }
+
+    TCP_DIRECTION_UNKNOWN
+}
 
 #[kprobe]
 pub fn tcpdump(ctx: ProbeContext) -> u32 {
@@ -50,7 +77,7 @@ fn try_tcpdump(ctx: ProbeContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
-    if state != TCP_ESTABLISHED && state != TCP_SYN_SENT && state != TCP_SYN_RECV {
+    if state < TCP_ESTABLISHED || state > TCP_LISTEN {
         return Ok(0);
     }
 
@@ -68,11 +95,7 @@ fn try_tcpdump(ctx: ProbeContext) -> Result<u32, u32> {
         event.dst_port = u16::from_be(ports.skc_dport as u16);
     }
 
-    event.direction = match state {
-        TCP_SYN_SENT => TCP_DIRECTION_OUTGOING,
-        TCP_SYN_RECV => TCP_DIRECTION_INCOMING,
-        _ => TCP_DIRECTION_UNKNOWN,
-    };
+    event.direction = infer_direction(state, event.src_port, event.dst_port);
 
     unsafe {
         (*ebpf::events_map()).output(&ctx, &event, 0);

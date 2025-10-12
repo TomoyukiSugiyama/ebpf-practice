@@ -7,6 +7,15 @@ pub const TCP_DIRECTION_INCOMING: u8 = 2;
 pub const TCP_STATE_ESTABLISHED: u32 = 1;
 pub const TCP_STATE_SYN_SENT: u32 = 2;
 pub const TCP_STATE_SYN_RECV: u32 = 3;
+pub const TCP_STATE_FIN_WAIT1: u32 = 4;
+pub const TCP_STATE_FIN_WAIT2: u32 = 5;
+pub const TCP_STATE_TIME_WAIT: u32 = 6;
+pub const TCP_STATE_CLOSE: u32 = 7;
+pub const TCP_STATE_CLOSE_WAIT: u32 = 8;
+pub const TCP_STATE_LAST_ACK: u32 = 9;
+pub const TCP_STATE_LISTEN: u32 = 10;
+pub const TCP_STATE_CLOSING: u32 = 11;
+pub const TCP_STATE_NEW_SYN_RECV: u32 = 12;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -58,8 +67,10 @@ pub mod ebpf {
 #[cfg(feature = "user")]
 pub mod user {
     use super::{
-        TCP_DIRECTION_INCOMING, TCP_DIRECTION_OUTGOING, TCP_DIRECTION_UNKNOWN,
-        TCP_STATE_ESTABLISHED, TCP_STATE_SYN_RECV, TCP_STATE_SYN_SENT, TcpEvent,
+        TCP_DIRECTION_INCOMING, TCP_DIRECTION_OUTGOING, TCP_STATE_CLOSE, TCP_STATE_CLOSE_WAIT,
+        TCP_STATE_CLOSING, TCP_STATE_ESTABLISHED, TCP_STATE_FIN_WAIT1, TCP_STATE_FIN_WAIT2,
+        TCP_STATE_LAST_ACK, TCP_STATE_LISTEN, TCP_STATE_NEW_SYN_RECV, TCP_STATE_SYN_RECV,
+        TCP_STATE_SYN_SENT, TCP_STATE_TIME_WAIT, TcpEvent,
     };
     use aya::Pod;
     use std::{
@@ -77,7 +88,6 @@ pub mod user {
             match self.direction {
                 TCP_DIRECTION_OUTGOING => "out",
                 TCP_DIRECTION_INCOMING => "in",
-                TCP_DIRECTION_UNKNOWN => "?",
                 _ => "?",
             }
         }
@@ -91,6 +101,15 @@ pub mod user {
                 TCP_STATE_ESTABLISHED => "ESTABLISHED",
                 TCP_STATE_SYN_SENT => "SYN_SENT",
                 TCP_STATE_SYN_RECV => "SYN_RECV",
+                TCP_STATE_FIN_WAIT1 => "FIN_WAIT1",
+                TCP_STATE_FIN_WAIT2 => "FIN_WAIT2",
+                TCP_STATE_TIME_WAIT => "TIME_WAIT",
+                TCP_STATE_CLOSE => "CLOSE",
+                TCP_STATE_CLOSE_WAIT => "CLOSE_WAIT",
+                TCP_STATE_LAST_ACK => "LAST_ACK",
+                TCP_STATE_LISTEN => "LISTEN",
+                TCP_STATE_CLOSING => "CLOSING",
+                TCP_STATE_NEW_SYN_RECV => "NEW_SYN_RECV",
                 _ => "STATE",
             }
         }
