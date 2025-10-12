@@ -20,6 +20,7 @@ const TCP_ESTABLISHED: i32 = 1;
 const TCP_SYN_SENT: i32 = 2;
 const TCP_SYN_RECV: i32 = 3;
 const TCP_LISTEN: i32 = 10;
+const TCP_NEW_SYN_RECV: i32 = 12;
 
 fn infer_direction(state: i32, src_port: u16, dst_port: u16) -> u8 {
     if state == TCP_SYN_SENT {
@@ -77,7 +78,7 @@ fn try_tcpdump(ctx: ProbeContext) -> Result<u32, u32> {
         return Ok(0);
     }
 
-    if state < TCP_ESTABLISHED || state > TCP_LISTEN {
+    if state < TCP_ESTABLISHED || state > TCP_NEW_SYN_RECV {
         return Ok(0);
     }
 
