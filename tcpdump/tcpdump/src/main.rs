@@ -15,6 +15,7 @@ use aya::util::online_cpus;
 use bytes::BytesMut;
 use log::{debug, info, warn};
 use tcpdump_common::TcpEvent;
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{signal, task};
 
 const EVENT_SIZE: usize = core::mem::size_of::<TcpEvent>();
@@ -41,26 +42,35 @@ fn parse_event(bytes: &BytesMut) -> Option<TcpEvent> {
 
 fn log_event(cpu_id: u32, bytes: &BytesMut) {
     static PRINT_HEADER: Once = Once::new();
-    static START_TS: OnceLock<u64> = OnceLock::new();
+    static BASE_MONO_TS: OnceLock<u64> = OnceLock::new();
+    static BASE_WALL_TIME: OnceLock<OffsetDateTime> = OnceLock::new();
 
     match parse_event(bytes) {
         Some(event) => {
             PRINT_HEADER.call_once(|| {
                 info!(
-                    "{:<3} {:<7} {:<7} {:<16} {:>12} {:<4} {:<11} {:>2} {:<22} {:<22}",
-                    "CPU", "PID", "TGID", "COMM", "TIME(s)", "DIR", "STATE", "ID", "SRC", "DST"
+                    "{:<3} {:<7} {:<7} {:<16} {:<35} {:<4} {:<11} {:>2} {:<22} {:<22}",
+                    "CPU", "PID", "TGID", "COMM", "TIME", "DIR", "STATE", "ID", "SRC", "DST"
                 );
             });
-            let base_ts = *START_TS.get_or_init(|| event.timestamp_ns());
-            let ts_ns = event.timestamp_ns().saturating_sub(base_ts);
-            let ts_secs = Duration::from_nanos(ts_ns).as_secs_f64();
+            let base_ts = *BASE_MONO_TS.get_or_init(|| event.timestamp_ns());
+            let base_wall = *BASE_WALL_TIME.get_or_init(|| {
+                OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc())
+            });
+            let delta_ns = event.timestamp_ns().saturating_sub(base_ts);
+            let seconds = (delta_ns / 1_000_000_000) as i64;
+            let nanos = (delta_ns % 1_000_000_000) as i32;
+            let event_time = base_wall + TimeDuration::new(seconds, nanos);
+            let formatted_ts = event_time
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| format!("{event_time:?}"));
             info!(
-                "{:<3} {:<7} {:<7} {:<16} {:>12} {:<4} {:<11} {:>2} {:<22} {:<22}",
+                "{:<3} {:<7} {:<7} {:<16} {:<35} {:<4} {:<11} {:>2} {:<22} {:<22}",
                 cpu_id,
                 event.pid,
                 event.tgid,
                 event.command(),
-                format!("{ts_secs:.6}"),
+                formatted_ts,
                 event.direction_label(),
                 event.state_label(),
                 event.state(),
