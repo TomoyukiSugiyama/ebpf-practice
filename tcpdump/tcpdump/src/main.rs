@@ -146,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
 
     let program: &mut KProbe = ebpf.program_mut("tcpdump").unwrap().try_into()?;
     program.load()?;
-    program.attach("tcp_connect", 0)?;
+    program.attach("tcp_set_state", 0)?;
 
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
