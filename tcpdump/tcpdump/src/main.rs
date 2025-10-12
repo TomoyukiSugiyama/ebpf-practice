@@ -21,6 +21,19 @@ use tokio::{signal, task};
 const EVENT_SIZE: usize = core::mem::size_of::<TcpEvent>();
 const BUFFER_COUNT: usize = 4;
 
+static PRINT_HEADER: Once = Once::new();
+static BASE_MONO_TS: OnceLock<u64> = OnceLock::new();
+static BASE_WALL_TIME: OnceLock<OffsetDateTime> = OnceLock::new();
+
+fn print_header() {
+    PRINT_HEADER.call_once(|| {
+        info!(
+            "{:<3} {:<7} {:<7} {:<16} {:<35} {:<4} {:<11} {:>2} {:<22} {:<22}",
+            "CPU", "PID", "TGID", "COMM", "TIME", "DIR", "STATE", "ID", "SRC", "DST"
+        );
+    });
+}
+
 #[inline]
 fn parse_event(bytes: &BytesMut) -> Option<TcpEvent> {
     if bytes.len() < EVENT_SIZE {
@@ -41,18 +54,8 @@ fn parse_event(bytes: &BytesMut) -> Option<TcpEvent> {
 }
 
 fn log_event(cpu_id: u32, bytes: &BytesMut) {
-    static PRINT_HEADER: Once = Once::new();
-    static BASE_MONO_TS: OnceLock<u64> = OnceLock::new();
-    static BASE_WALL_TIME: OnceLock<OffsetDateTime> = OnceLock::new();
-
     match parse_event(bytes) {
         Some(event) => {
-            PRINT_HEADER.call_once(|| {
-                info!(
-                    "{:<3} {:<7} {:<7} {:<16} {:<35} {:<4} {:<11} {:>2} {:<22} {:<22}",
-                    "CPU", "PID", "TGID", "COMM", "TIME", "DIR", "STATE", "ID", "SRC", "DST"
-                );
-            });
             let base_ts = *BASE_MONO_TS.get_or_init(|| event.timestamp_ns());
             let base_wall = *BASE_WALL_TIME.get_or_init(|| {
                 OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc())
@@ -158,12 +161,13 @@ async fn main() -> anyhow::Result<()> {
 
     let program: &mut KProbe = ebpf.program_mut("tcpdump").unwrap().try_into()?;
     program.load()?;
-    program.attach("tcp_set_state", 0)?;
 
     let ctrl_c = signal::ctrl_c();
-    println!("Waiting for Ctrl-C...");
+    info!("Waiting for Ctrl-C...");
+    print_header();
+    program.attach("tcp_set_state", 0)?;
     ctrl_c.await?;
-    println!("Exiting...");
+    info!("Exiting...");
 
     running.store(false, Ordering::Relaxed);
     for handle in handles {
