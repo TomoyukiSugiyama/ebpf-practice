@@ -650,6 +650,7 @@ name = "tcpdump-common"
 version = "0.1.0"
 dependencies = [
  "aya",
+ "aya-ebpf",
 ]
 
 [[package]]

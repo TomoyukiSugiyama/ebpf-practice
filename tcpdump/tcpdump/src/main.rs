@@ -1,9 +1,11 @@
 use anyhow::Context as _;
+use aya::maps::ring_buf::RingBuf;
 use aya::programs::{Xdp, XdpFlags};
 use clap::Parser;
 #[rustfmt::skip]
 use log::{debug, warn};
-use tokio::signal;
+use tcpdump_common::user::PacketEventExt as _;
+use tokio::{signal, task};
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -53,16 +55,42 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
+    let ring_buf_map = ebpf
+        .take_map("EVENTS")
+        .context("EVENTS map not found")?;
+    let ring_buf = RingBuf::try_from(ring_buf_map)?;
+
     let Opt { iface } = opt;
     let program: &mut Xdp = ebpf.program_mut("tcpdump").unwrap().try_into()?;
     program.load()?;
     program.attach(&iface, XdpFlags::default())
         .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
 
-    let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
-    ctrl_c.await?;
+
+    let ring_buf = tokio::io::unix::AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
+
+    let reader = task::spawn(async move {
+        let mut ring_buf = ring_buf;
+        loop {
+            let mut guard = ring_buf.readable_mut().await?;
+            {
+                let ring_buf = guard.get_inner_mut();
+                while let Some(event) = ring_buf.next() {
+                    if let Some(packet) = event.packet_event() {
+                        println!("packet: {:02x?}", packet.payload());
+                    }
+                }
+            }
+            guard.clear_ready();
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    });
+
+    signal::ctrl_c().await?;
     println!("Exiting...");
+    reader.abort();
 
     Ok(())
 }
