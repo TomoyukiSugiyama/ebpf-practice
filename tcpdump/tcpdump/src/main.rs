@@ -8,8 +8,9 @@ use std::{
     time::Duration,
 };
 
-use aya::maps::PerfEventArray;
+use aya::Ebpf;
 use aya::maps::perf::{PerfBufferError, PerfEventArrayBuffer};
+use aya::maps::{MapData, PerfEventArray};
 use aya::programs::KProbe;
 use aya::util::online_cpus;
 use bytes::BytesMut;
@@ -88,12 +89,7 @@ fn log_event(cpu_id: u32, bytes: &BytesMut) {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
-    // Bump the memlock rlimit. This is needed for older kernels that don't use the
-    // new memcg based accounting, see https://lwn.net/Articles/837122/
+fn bump_memlock_rlimit() {
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -102,11 +98,9 @@ async fn main() -> anyhow::Result<()> {
     if ret != 0 {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
+}
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
+fn load_ebpf() -> anyhow::Result<Ebpf> {
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/tcpdump"
@@ -114,54 +108,79 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf) {
         warn!("aya-log disabled: {e}");
     }
+    Ok(ebpf)
+}
 
-    let mut events = PerfEventArray::try_from(
-        ebpf.take_map("EVENTS")
-            .ok_or_else(|| anyhow::anyhow!("EVENTS map missing"))?,
-    )?;
-    let mut perf_buffers: Vec<(u32, PerfEventArrayBuffer<_>)> = online_cpus()
+fn create_event_array(ebpf: &mut Ebpf) -> anyhow::Result<PerfEventArray<MapData>> {
+    let map = ebpf
+        .take_map("EVENTS")
+        .ok_or_else(|| anyhow::anyhow!("EVENTS map missing"))?;
+    PerfEventArray::try_from(map).map_err(Into::into)
+}
+
+fn spawn_reader_tasks(
+    events: &mut PerfEventArray<MapData>,
+    running: Arc<AtomicBool>,
+) -> anyhow::Result<Vec<task::JoinHandle<()>>> {
+    let perf_buffers = online_cpus()
         .map_err(|(_, error)| error)?
         .into_iter()
         .map(|cpu_id| events.open(cpu_id, None).map(|buf| (cpu_id, buf)))
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let running = Arc::new(AtomicBool::new(true));
-    let mut handles = Vec::new();
-    for (cpu_id, mut buf) in perf_buffers.drain(..) {
+    let mut handles = Vec::with_capacity(perf_buffers.len());
+    for (cpu_id, buf) in perf_buffers.into_iter() {
         let running = running.clone();
         handles.push(task::spawn_blocking(move || {
-            let mut buffers: [BytesMut; BUFFER_COUNT] =
-                core::array::from_fn(|_| BytesMut::with_capacity(EVENT_SIZE));
-            loop {
-                if !running.load(Ordering::Relaxed) {
-                    break;
-                }
-                match buf.read_events(&mut buffers) {
-                    Ok(events) => {
-                        if events.read > 0 {
-                            buffers
-                                .iter()
-                                .filter(|buf| !buf.is_empty())
-                                .for_each(|buf| log_event(cpu_id, buf));
-                        }
-                        buffers.iter_mut().for_each(|buf| buf.clear());
-                        if events.read == 0 {
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                    }
-                    Err(PerfBufferError::NoBuffers) => {
-                        warn!("perf buffer returned no buffers");
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(e) => warn!("failed to read perf event on cpu {cpu_id}: {e}"),
-                }
-            }
+            let mut buf = buf;
+            reader_loop(cpu_id, running, &mut buf);
         }));
     }
 
-    let program: &mut KProbe = ebpf.program_mut("tcpdump").unwrap().try_into()?;
-    program.load()?;
+    Ok(handles)
+}
 
+fn reader_loop(cpu_id: u32, running: Arc<AtomicBool>, buf: &mut PerfEventArrayBuffer<MapData>) {
+    let mut buffers: [BytesMut; BUFFER_COUNT] =
+        core::array::from_fn(|_| BytesMut::with_capacity(EVENT_SIZE));
+
+    while running.load(Ordering::Relaxed) {
+        match buf.read_events(&mut buffers) {
+            Ok(events) => {
+                if events.read > 0 {
+                    buffers
+                        .iter()
+                        .filter(|buf| !buf.is_empty())
+                        .for_each(|buf| log_event(cpu_id, buf));
+                }
+                buffers.iter_mut().for_each(|buf| buf.clear());
+                if events.read == 0 {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Err(PerfBufferError::NoBuffers) => {
+                warn!("perf buffer returned no buffers");
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => warn!("failed to read perf event on cpu {cpu_id}: {e}"),
+        }
+    }
+}
+
+fn load_program(ebpf: &mut Ebpf) -> anyhow::Result<&mut KProbe> {
+    let program = ebpf
+        .program_mut("tcpdump")
+        .ok_or_else(|| anyhow::anyhow!("tcpdump program not found"))?;
+    let program: &mut KProbe = program.try_into()?;
+    program.load()?;
+    Ok(program)
+}
+
+async fn run_program(
+    program: &mut KProbe,
+    running: Arc<AtomicBool>,
+    handles: Vec<task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
     let ctrl_c = signal::ctrl_c();
     info!("Waiting for Ctrl-C...");
     print_header();
@@ -177,4 +196,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    env_logger::init();
+
+    bump_memlock_rlimit();
+
+    let mut ebpf = load_ebpf()?;
+    let mut events = create_event_array(&mut ebpf)?;
+    let running = Arc::new(AtomicBool::new(true));
+    let handles = spawn_reader_tasks(&mut events, running.clone())?;
+    let program = load_program(&mut ebpf)?;
+
+    run_program(program, running, handles).await
 }
