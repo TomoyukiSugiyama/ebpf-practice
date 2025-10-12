@@ -1,13 +1,10 @@
 ## Cross-compiling on macOS
-See `tcpdump/README.md` for cross-compiling setup and build instructions. Following those steps, you can build the `tcpdump` binary for the `aarch64-unknown-linux-musl` target.
+See `tcpdump/README.md` for cross-compiling setup and build instructions. Following those steps builds the `tcpdump` binary for the `aarch64-unknown-linux-musl` target, producing a statically linked Linux ARM64 binary from macOS using musl.
 
-This produces a statically linked Linux ARM64 binary from macOS using musl.
+## Create an Ubuntu VM
+Install Multipass by following the official documentation for your operating system: https://documentation.ubuntu.com/multipass/latest/tutorial/
 
-## Create a VM for Ubuntu
-It is necessary to install Multipass. Please follow the official documentation for detailed installation instructions, making sure to select the appropriate procedure for your operating system. Administrator privileges may be required for installation.
-https://documentation.ubuntu.com/multipass/latest/tutorial/
-
-Use the following commands to create a lightweight Ubuntu 24.04 VM and verify it is running:
+Then create a lightweight Ubuntu 24.04 VM and confirm it is running:
 
 ```
 % multipass launch --name ubuntu-2404 --cpus 1 --memory 1G --disk 5G 24.04
@@ -16,22 +13,21 @@ Name                    State             IPv4             Image
 ubuntu-2404             Running           192.168.64.5     Ubuntu 24.04 LTS
 ```
 
-- **--name ubuntu-2404**: Sets the VM instance name.
-- **--cpus 1**: Allocates 1 virtual CPU.
-- **--memory 1G**: Allocates 1 GB of RAM.
-- **--disk 5G**: Allocates a 5 GB disk.
-- **24.04**: Uses the Ubuntu 24.04 image.
-- **multipass ls**: Lists running and stopped Multipass instances.
+- `--name ubuntu-2404`: Sets the VM instance name.
+- `--cpus 1`: Allocates 1 virtual CPU.
+- `--memory 1G`: Allocates 1 GB of RAM.
+- `--disk 5G`: Allocates a 5 GB disk.
+- `24.04`: Uses the Ubuntu 24.04 image.
+- `multipass ls`: Lists running and stopped Multipass instances.
 
-## Transfer the tcpdump binary to the VM 
-
-Copies the built `tcpdump` binary from your host into the VM user's home directory as `~/tcpdump`.
+## Transfer the `tcpdump` Binary to the VM
+Copy the built `tcpdump` binary into the VM user's home directory as `~/tcpdump`:
 
 ```
 % multipass transfer target/aarch64-unknown-linux-musl/release/tcpdump ubuntu-2404:tcpdump
 ```
 
-## Start the tcpdump binary in a virtual machine
+## Run `tcpdump` Inside the VM
 ```
 % multipass exec ubuntu-2404 -- bash -c 'sudo RUST_LOG=info ./tcpdump'
 Waiting for Ctrl-C...
@@ -44,12 +40,12 @@ Waiting for Ctrl-C...
 
 ```
 
-- **multipass exec ... 'sudo ./tcpdump'**: Runs a one-off command inside the VM as root.
-- **multipass shell ...** then `sudo ./tcpdump`: Opens an interactive shell and runs it manually.
-- **sudo**: Required to load eBPF programs and capture packets.
-- While running, you'll see "Waiting for Ctrl-C...". Press Ctrl-C to stop.
+- `multipass exec ... 'sudo ./tcpdump'`: Runs a one-off command inside the VM as root.
+- `multipass shell ...` followed by `sudo ./tcpdump`: Opens an interactive shell and runs it manually.
+- `sudo`: Required to load eBPF programs and capture events.
+- While running, the program prints "Waiting for Ctrl-C...". Press Ctrl-C to stop.
 
-### Sample output
+### Sample Output
 ```
 ubuntu@ubuntu-2404:~$ sudo RUST_LOG=info ./tcpdump
 [WARN  tcpdump] aya-log disabled: AYA_LOGS not found
@@ -62,17 +58,17 @@ Waiting for Ctrl-C...
 [INFO  tcpdump] 0   1317532 1317532 curl             2025-10-12T20:05:37.576407805+09:00 out  SYN_SENT     2 127.0.0.1:0            127.0.0.1:80
 [INFO  tcpdump] 0   1317532 1317532 curl             2025-10-12T20:05:37.576476556+09:00 out  CLOSE        7 127.0.0.1:56408        127.0.0.1:80
 [INFO  tcpdump] 0   1317744 1317744 curl             2025-10-12T20:05:51.950932039+09:00 out  SYN_SENT     2 192.168.64.5:0         142.251.42.164:443
-[INFO  tcpdump] 0   0       0       swapper/0        2025-10-12T20:05:51.9577553+09:00   out  ESTABLISHED  1 192.168.64.5:41786     142.251.42.164:443
+[INFO  tcpdump] 0   0       0       swapper/0        2025-10-12T20:05:51.9577553+09:00  out  ESTABLISHED  1 192.168.64.5:41786     142.251.42.164:443
 [INFO  tcpdump] 0   1317744 1317744 curl             2025-10-12T20:05:52.176226294+09:00 out  FIN_WAIT1    4 192.168.64.5:41786     142.251.42.164:443
 [INFO  tcpdump] 0   0       0       swapper/0        2025-10-12T20:05:52.186390581+09:00 out  FIN_WAIT2    5 192.168.64.5:41786     142.251.42.164:443
-[INFO  tcpdump] 0   0       0       swapper/0        2025-10-12T20:05:52.18644504+09:00  out  CLOSE        7 192.168.64.5:41786     142.251.42.164:443
+[INFO  tcpdump] 0   0       0       swapper/0        2025-10-12T20:05:52.18644504+09:00 out  CLOSE        7 192.168.64.5:41786     142.251.42.164:443
 ```
 
 - `CPU`: Logical CPU that emitted the perf event.
-- `PID` / `TGID` / `COMM`: Process/thread identifiers and command name for the task that triggered the TCP state change.
-- `TIME`: Local timestamp (RFC3339) reconstructed from monotonic time, so it aligns with wall-clock time.
-- `DIR`: Traffic direction heuristic (`out`, `in`, `?`). SYN 送信やエフェメラル/ウェルノウンポートから推定しています。
-- `STATE` / `ID`: TCP state labelと、カーネル定義の数値 ID。`CLOSE_WAIT`, `LAST_ACK` などの遷移がそのまま表示されます。
-- `SRC` / `DST`: ローカル/リモートの IPv4 アドレスとポートをソケット形式で表示します。
-- `[WARN tcpdump] aya-log disabled`: `AYA_LOGS` 環境変数が未設定の場合の警告です。機能に問題はありません。
-- ログは Ctrl-C を押すまで継続して流れます。終了後にファイルへリダイレクトして解析することも可能です。
+- `PID` / `TGID` / `COMM`: Process and thread identifiers plus the command name for the task that triggered the TCP state change.
+- `TIME`: Local timestamp (RFC3339) reconstructed from monotonic time so it aligns with wall-clock time.
+- `DIR`: Direction inferred from the SYN state and whether the ports look ephemeral (`out`, `in`, or `?`).
+- `STATE` / `ID`: TCP state label and the numeric identifier defined by the kernel (for example `CLOSE_WAIT`, `LAST_ACK`).
+- `SRC` / `DST`: Local and remote IPv4 socket addresses shown in `IP:port` form.
+- `[WARN tcpdump] aya-log disabled`: Indicates that `AYA_LOGS` is not set; logging still works.
+- Logs continue until you press Ctrl-C. Redirect the output to a file if you need to analyze it later.
