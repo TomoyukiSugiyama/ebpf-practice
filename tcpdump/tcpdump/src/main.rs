@@ -1,7 +1,7 @@
 use std::{
     ptr,
     sync::{
-        Arc, Once,
+        Arc, Once, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -26,13 +26,7 @@ fn parse_event(bytes: &BytesMut) -> Option<TcpEvent> {
         return None;
     }
 
-    let mut event = TcpEvent {
-        pid: 0,
-        tgid: 0,
-        comm: [0; 16],
-        src_ip: 0,
-        dst_ip: 0,
-    };
+    let mut event = TcpEvent::default();
 
     unsafe {
         ptr::copy_nonoverlapping(
@@ -47,23 +41,31 @@ fn parse_event(bytes: &BytesMut) -> Option<TcpEvent> {
 
 fn log_event(cpu_id: u32, bytes: &BytesMut) {
     static PRINT_HEADER: Once = Once::new();
+    static START_TS: OnceLock<u64> = OnceLock::new();
 
     match parse_event(bytes) {
         Some(event) => {
             PRINT_HEADER.call_once(|| {
                 info!(
-                    "{:<3} {:<7} {:<7} {:<16} {:<15} {:<15}",
-                    "CPU", "PID", "TGID", "COMM", "SRC", "DST"
+                    "{:<3} {:<7} {:<7} {:<16} {:>12} {:<4} {:<11} {:>2} {:<22} {:<22}",
+                    "CPU", "PID", "TGID", "COMM", "TIME(s)", "DIR", "STATE", "ID", "SRC", "DST"
                 );
             });
+            let base_ts = *START_TS.get_or_init(|| event.timestamp_ns());
+            let ts_ns = event.timestamp_ns().saturating_sub(base_ts);
+            let ts_secs = Duration::from_nanos(ts_ns).as_secs_f64();
             info!(
-                "{:<3} {:<7} {:<7} {:<16} {:<15} {:<15}",
+                "{:<3} {:<7} {:<7} {:<16} {:>12} {:<4} {:<11} {:>2} {:<22} {:<22}",
                 cpu_id,
                 event.pid,
                 event.tgid,
                 event.command(),
-                event.src_addr(),
-                event.dst_addr()
+                format!("{ts_secs:.6}"),
+                event.direction_label(),
+                event.state_label(),
+                event.state(),
+                event.src_socket(),
+                event.dst_socket()
             );
         }
         None => warn!(
