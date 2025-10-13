@@ -5,4 +5,3 @@ pub struct PacketEvent {
 }
 
 pub const MAX_PAYLOAD_LEN: usize = 256;
-

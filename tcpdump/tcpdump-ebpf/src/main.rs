@@ -3,15 +3,15 @@
 
 #[cfg(target_arch = "bpf")]
 use aya_ebpf::{
-    bindings::xdp_action,
     EbpfContext,
+    bindings::xdp_action,
     helpers,
     macros::{map, xdp},
     maps::RingBuf,
     programs::XdpContext,
 };
 #[cfg(target_arch = "bpf")]
-use tcpdump_common::ebpf::{PacketEvent, MAX_PAYLOAD_LEN};
+use tcpdump_common::ebpf::{MAX_PAYLOAD_LEN, PacketEvent};
 
 #[cfg(target_arch = "bpf")]
 const RING_BUF_CAPACITY: u32 = 1 << 12;
@@ -27,7 +27,11 @@ const PACKET_EVENT_CAPACITY: usize = PACKET_EVENT_HEADER_SIZE + MAX_PAYLOAD_LEN;
 static mut EVENTS: RingBuf = RingBuf::with_byte_size(RING_BUF_CAPACITY, 0);
 
 #[cfg(target_arch = "bpf")]
-fn load_packet(ctx: &XdpContext, len: u32, entry: &mut aya_ebpf::maps::ring_buf::RingBufBytes<'_>) -> Result<(), i64> {
+fn load_packet(
+    ctx: &XdpContext,
+    len: u32,
+    entry: &mut aya_ebpf::maps::ring_buf::RingBufBytes<'_>,
+) -> Result<(), i64> {
     if len == 0 {
         return Ok(());
     }
@@ -39,12 +43,7 @@ fn load_packet(ctx: &XdpContext, len: u32, entry: &mut aya_ebpf::maps::ring_buf:
     header.len = len;
 
     let ret = unsafe {
-        helpers::bpf_xdp_load_bytes(
-            ctx.as_ptr().cast(),
-            0,
-            payload_buf.as_mut_ptr().cast(),
-            len,
-        )
+        helpers::bpf_xdp_load_bytes(ctx.as_ptr().cast(), 0, payload_buf.as_mut_ptr().cast(), len)
     };
 
     if ret != 0 {

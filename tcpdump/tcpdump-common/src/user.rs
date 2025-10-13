@@ -30,4 +30,3 @@ impl PacketEventExt for RingBufItem<'_> {
         PacketEvent::from_bytes(self)
     }
 }
-
