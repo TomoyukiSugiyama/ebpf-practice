@@ -2,11 +2,17 @@ use anyhow::Context as _;
 use aya::maps::ring_buf::RingBuf;
 use aya::programs::{Xdp, XdpFlags};
 use clap::Parser;
-#[rustfmt::skip]
-use log::{debug, info, warn};
-use std::{fmt, net::Ipv4Addr};
+use log::{debug, warn};
+use std::{
+    fmt,
+    net::Ipv4Addr,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tcpdump_common::user::PacketEventExt as _;
-use tokio::{signal, task};
+use tokio::{signal, sync::mpsc, task};
+
+#[rustfmt::skip]
+use comfy_table::{presets::UTF8_FULL, Cell, Table};
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -70,39 +76,77 @@ async fn main() -> anyhow::Result<()> {
     let ring_buf =
         tokio::io::unix::AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
 
-    let reader = task::spawn(async move {
-        let mut ring_buf = ring_buf;
-        loop {
-            let mut guard = ring_buf.readable_mut().await?;
-            {
-                let ring_buf = guard.get_inner_mut();
-                while let Some(event) = ring_buf.next() {
-                    if let Some(packet) = event.packet_event() {
-                        let payload = packet.payload();
-                        debug!("raw packet: {:02x?}", payload);
-                        match describe_packet(payload) {
-                            Ok(summary) => info!("{summary}"),
-                            Err(err) => {
-                                warn!("failed to analyze packet (len={}): {err}", payload.len())
+    let (tx, rx) = mpsc::channel::<PacketSummary>(1024);
+
+    let printer_handle = task::spawn(async move {
+        let mut table = PacketTable::new();
+        let mut rx = rx;
+        while let Some(summary) = rx.recv().await {
+            table.push(summary);
+        }
+        table.flush();
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let reader = {
+        let tx = tx.clone();
+        task::spawn(async move {
+            let mut ring_buf = ring_buf;
+            let mut parsed_packets = Vec::new();
+
+            'reader: loop {
+                let mut guard = ring_buf.readable_mut().await?;
+                {
+                    let ring_buf = guard.get_inner_mut();
+                    while let Some(event) = ring_buf.next() {
+                        if let Some(packet) = event.packet_event() {
+                            let payload = packet.payload();
+                            debug!("raw packet: {:02x?}", payload);
+                            match describe_packet(payload) {
+                                Ok(summary) => parsed_packets.push(summary),
+                                Err(err) => {
+                                    warn!(
+                                        "failed to analyze packet (len={}): {err}",
+                                        payload.len()
+                                    );
+                                }
                             }
                         }
                     }
                 }
+                guard.clear_ready();
+
+                for summary in parsed_packets.drain(..) {
+                    if tx.send(summary).await.is_err() {
+                        break 'reader;
+                    }
+                }
             }
-            guard.clear_ready();
-        }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    });
+
+            Ok::<(), anyhow::Error>(())
+        })
+    };
 
     signal::ctrl_c().await?;
     println!("Exiting...");
     reader.abort();
+    drop(tx);
+
+    match reader.await {
+        Err(err) if !err.is_cancelled() => warn!("packet reader task failed: {err}"),
+        _ => {}
+    }
+
+    match printer_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!("table printer task failed: {err}"),
+        Err(err) => warn!("table printer task join failed: {err}"),
+    }
 
     Ok(())
 }
 
-fn describe_packet(bytes: &[u8]) -> Result<String, &'static str> {
+fn describe_packet(bytes: &[u8]) -> Result<PacketSummary, &'static str> {
     const ETH_HEADER_LEN: usize = 14;
 
     if bytes.len() < ETH_HEADER_LEN {
@@ -117,13 +161,20 @@ fn describe_packet(bytes: &[u8]) -> Result<String, &'static str> {
     let frame_len = bytes.len();
 
     if ethertype != 0x0800 {
-        return Ok(format!(
-            "eth {} -> {} type=0x{:04x} captured_len={}",
-            MacAddr(src_mac),
-            MacAddr(dst_mac),
+        return Ok(PacketSummary {
+            timestamp: SystemTime::now(),
+            src_mac: MacAddr(src_mac),
+            dst_mac: MacAddr(dst_mac),
             ethertype,
-            frame_len
-        ));
+            proto: PacketProtocol::Other { value: ethertype },
+            src_addr: PacketAddr::None,
+            dst_addr: PacketAddr::None,
+            src_port: None,
+            dst_port: None,
+            tcp_flags: None,
+            frame_len,
+            payload_len: 0,
+        });
     }
 
     let ip_bytes = &bytes[ETH_HEADER_LEN..];
@@ -151,18 +202,20 @@ fn describe_packet(bytes: &[u8]) -> Result<String, &'static str> {
     let dst_ip = Ipv4Addr::new(ip_bytes[16], ip_bytes[17], ip_bytes[18], ip_bytes[19]);
 
     if protocol != 6 {
-        return Ok(format!(
-            "eth {} -> {} type=0x{:04x}; ipv4 {} -> {} ttl={} total_len={} captured_len={} proto={}",
-            MacAddr(src_mac),
-            MacAddr(dst_mac),
+        return Ok(PacketSummary {
+            timestamp: SystemTime::now(),
+            src_mac: MacAddr(src_mac),
+            dst_mac: MacAddr(dst_mac),
             ethertype,
-            src_ip,
-            dst_ip,
-            ttl,
-            total_length,
+            proto: PacketProtocol::Ipv4 { ttl, protocol },
+            src_addr: PacketAddr::Ipv4(src_ip),
+            dst_addr: PacketAddr::Ipv4(dst_ip),
+            src_port: None,
+            dst_port: None,
+            tcp_flags: None,
             frame_len,
-            protocol
-        ));
+            payload_len: total_length.saturating_sub(ihl),
+        });
     }
 
     let tcp_bytes = &ip_bytes[ihl..];
@@ -187,25 +240,27 @@ fn describe_packet(bytes: &[u8]) -> Result<String, &'static str> {
     let window = u16::from_be_bytes([tcp_bytes[14], tcp_bytes[15]]);
     let payload_len = tcp_bytes.len().saturating_sub(data_offset);
 
-    Ok(format!(
-        "eth {} -> {} type=0x{:04x}; ipv4 {} -> {} ttl={} total_len={} captured_len={}; tcp {} -> {} seq={} ack={} flags=[{}] win={} tcp_header_len={} payload={}B",
-        MacAddr(src_mac),
-        MacAddr(dst_mac),
+    Ok(PacketSummary {
+        timestamp: SystemTime::now(),
+        src_mac: MacAddr(src_mac),
+        dst_mac: MacAddr(dst_mac),
         ethertype,
-        src_ip,
-        dst_ip,
-        ttl,
-        total_length,
+        proto: PacketProtocol::Tcp {
+            ttl,
+            total_length,
+            seq,
+            ack,
+            window,
+            tcp_header_len: data_offset,
+        },
+        src_addr: PacketAddr::Ipv4(src_ip),
+        dst_addr: PacketAddr::Ipv4(dst_ip),
+        src_port: Some(src_port),
+        dst_port: Some(dst_port),
+        tcp_flags: Some(TcpFlags(flags)),
         frame_len,
-        src_port,
-        dst_port,
-        seq,
-        ack,
-        TcpFlags(flags),
-        window,
-        data_offset,
-        payload_len
-    ))
+        payload_len,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -255,4 +310,172 @@ impl fmt::Display for TcpFlags {
 
         Ok(())
     }
+}
+
+struct PacketTable {
+    table: Option<Table>,
+    rows_in_chunk: usize,
+    total_rows: usize,
+}
+
+impl PacketTable {
+    fn new() -> Self {
+        Self {
+            table: None,
+            rows_in_chunk: 0,
+            total_rows: 0,
+        }
+    }
+
+    fn push(&mut self, summary: PacketSummary) {
+        let table = self.table.get_or_insert_with(new_table);
+
+        table.add_row(summary.into_row());
+        self.rows_in_chunk += 1;
+        self.total_rows += 1;
+
+        if self.rows_in_chunk >= 25 {
+            println!("{}", table.trim_fmt());
+            *table = new_table();
+            self.rows_in_chunk = 0;
+        }
+    }
+
+    fn flush(mut self) {
+        match (self.table.take(), self.rows_in_chunk, self.total_rows) {
+            (Some(table), rows, _) if rows > 0 => println!("{}", table.trim_fmt()),
+            (_, _, total) if total == 0 => println!("No packets captured."),
+            _ => {}
+        }
+    }
+}
+
+struct PacketSummary {
+    timestamp: SystemTime,
+    src_mac: MacAddr,
+    dst_mac: MacAddr,
+    ethertype: u16,
+    proto: PacketProtocol,
+    src_addr: PacketAddr,
+    dst_addr: PacketAddr,
+    src_port: Option<u16>,
+    dst_port: Option<u16>,
+    tcp_flags: Option<TcpFlags>,
+    frame_len: usize,
+    payload_len: usize,
+}
+
+enum PacketProtocol {
+    Other {
+        value: u16,
+    },
+    Ipv4 {
+        ttl: u8,
+        protocol: u8,
+    },
+    Tcp {
+        ttl: u8,
+        total_length: usize,
+        seq: u32,
+        ack: u32,
+        window: u16,
+        tcp_header_len: usize,
+    },
+}
+
+enum PacketAddr {
+    None,
+    Ipv4(Ipv4Addr),
+}
+
+impl PacketSummary {
+    fn into_row(self) -> Vec<Cell> {
+        let timestamp = format_timestamp(self.timestamp);
+        let proto = format_protocol(&self.proto);
+        let src_addr = format_addr(&self.src_addr);
+        let dst_addr = format_addr(&self.dst_addr);
+        let src_port = format_port(self.src_port);
+        let dst_port = format_port(self.dst_port);
+        let tcp_flags = self
+            .tcp_flags
+            .map(|flags| flags.to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        vec![
+            Cell::new(timestamp),
+            Cell::new(self.src_mac.to_string()),
+            Cell::new(self.dst_mac.to_string()),
+            Cell::new(format!("0x{:04x}", self.ethertype)),
+            Cell::new(src_addr),
+            Cell::new(dst_addr),
+            Cell::new(proto),
+            Cell::new(src_port),
+            Cell::new(dst_port),
+            Cell::new(tcp_flags),
+            Cell::new(self.frame_len.to_string()),
+            Cell::new(format!("{}", self.payload_len)),
+        ]
+    }
+}
+
+fn new_table() -> Table {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        Cell::new("Timestamp"),
+        Cell::new("Src MAC"),
+        Cell::new("Dst MAC"),
+        Cell::new("Ethertype"),
+        Cell::new("Src Addr"),
+        Cell::new("Dst Addr"),
+        Cell::new("Proto"),
+        Cell::new("Src Port"),
+        Cell::new("Dst Port"),
+        Cell::new("TCP Flags"),
+        Cell::new("Frame Len"),
+        Cell::new("Payload"),
+    ]);
+    table
+}
+
+fn format_timestamp(ts: SystemTime) -> String {
+    match ts.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            let secs = duration.as_secs();
+            let millis = duration.subsec_millis();
+            format!("{secs}.{millis:03}")
+        }
+        Err(_) => "-".to_string(),
+    }
+}
+
+fn format_protocol(proto: &PacketProtocol) -> String {
+    match proto {
+        PacketProtocol::Other { value } => format!("other(0x{:04x})", value),
+        PacketProtocol::Ipv4 { ttl, protocol } => {
+            format!("ipv4 ttl={ttl} proto={protocol}")
+        }
+        PacketProtocol::Tcp {
+            ttl,
+            total_length,
+            seq,
+            ack,
+            window,
+            tcp_header_len,
+        } => format!(
+            "tcp ttl={ttl} len={total_length} seq={seq} ack={ack} win={window} hdr={tcp_header_len}"
+        ),
+    }
+}
+
+fn format_addr(addr: &PacketAddr) -> String {
+    match addr {
+        PacketAddr::None => "-".to_string(),
+        PacketAddr::Ipv4(ip) => ip.to_string(),
+    }
+}
+
+fn format_port(port: Option<u16>) -> String {
+    port.map(|p| p.to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
