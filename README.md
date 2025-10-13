@@ -46,12 +46,12 @@ Waiting for Ctrl-C...
 - While running, the program prints "Waiting for Ctrl-C...". Press Ctrl-C to stop.
 
 ### Interactive UI controls
-- パケット一覧はカーソルで選択でき、画面上部に最新のパケットが流れます。
-- `↑ / ↓`: 1行スクロール
-- `PgUp / PgDn`: 10行スクロール
-- `Home / End`: 先頭 / 末尾へジャンプ
-- `q`, `Q`, `Esc`, または `Ctrl-C`: 終了
-- 選択した行の詳細が画面中央に、対応する生バイト列が画面下部に表示されます。
+- The packet list at the top updates in real time and you can move the cursor to select any row.
+- `↑ / ↓`: Scroll by one row
+- `PgUp / PgDn`: Scroll by ten rows
+- `Home / End`: Jump to the first / last packet
+- `q`, `Q`, `Esc`, or `Ctrl-C`: Exit the program
+- The middle pane shows detailed metadata for the selected packet, and the bottom pane shows the corresponding raw bytes.
 
 ### Sample Output
 ```
