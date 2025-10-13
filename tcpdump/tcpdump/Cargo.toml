@@ -11,9 +11,12 @@ tcpdump-common = { path = "../tcpdump-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crossterm = "0.29"
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+ratatui = "0.26"
 tokio = { workspace = true, features = [
     "macros",
     "rt",
@@ -23,7 +26,6 @@ tokio = { workspace = true, features = [
     "sync",
 ] }
 clap = { workspace = true, features = ["derive"] }
-comfy-table = "7.1"
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

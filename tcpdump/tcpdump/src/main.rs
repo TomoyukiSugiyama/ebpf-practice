@@ -1,18 +1,30 @@
-use anyhow::Context as _;
+use anyhow::{Context as _, Result};
 use aya::maps::ring_buf::RingBuf;
 use aya::programs::{Xdp, XdpFlags};
+use chrono::{DateTime, Local};
 use clap::Parser;
+use crossterm::{
+    event::{self, Event as CEvent, KeyCode, KeyEvent},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
 use log::{debug, warn};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell as TuiCell, Paragraph, Row, Table, TableState, Wrap},
+};
 use std::{
-    fmt,
+    fmt::{self, Write as FmtWrite},
+    io::{self, Stdout},
     net::Ipv4Addr,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime},
 };
 use tcpdump_common::user::PacketEventExt as _;
 use tokio::{signal, sync::mpsc, task};
-
-#[rustfmt::skip]
-use comfy_table::{presets::UTF8_FULL, Cell, Table};
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -21,13 +33,11 @@ struct Opt {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     let opt = Opt::parse();
 
     env_logger::init();
 
-    // Bump the memlock rlimit. This is needed for older kernels that don't use the
-    // new memcg based accounting, see https://lwn.net/Articles/837122/
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -37,25 +47,21 @@ async fn main() -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    // This will include your eBPF object file as raw bytes at compile-time and load it at
-    // runtime. This approach is recommended for most real-world use cases. If you would
-    // like to specify the eBPF program at runtime rather than at compile-time, you can
-    // reach for `Bpf::load_file` instead.
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/tcpdump"
     )))?;
     match aya_log::EbpfLogger::init(&mut ebpf) {
-        Err(e) => {
-            // This can happen if you remove all log statements from your eBPF program.
-            warn!("failed to initialize eBPF logger: {e}");
-        }
+        Err(e) => warn!("failed to initialize eBPF logger: {e}"),
         Ok(logger) => {
             let mut logger =
                 tokio::io::unix::AsyncFd::with_interest(logger, tokio::io::Interest::READABLE)?;
             tokio::task::spawn(async move {
                 loop {
-                    let mut guard = logger.readable_mut().await.unwrap();
+                    let mut guard = match logger.readable_mut().await {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
                     guard.get_inner_mut().flush();
                     guard.clear_ready();
                 }
@@ -68,34 +74,25 @@ async fn main() -> anyhow::Result<()> {
     let Opt { iface } = opt;
     let program: &mut Xdp = ebpf.program_mut("tcpdump").unwrap().try_into()?;
     program.load()?;
-    program.attach(&iface, XdpFlags::default())
-        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
-
-    println!("Waiting for Ctrl-C...");
+    program.attach(&iface, XdpFlags::default()).context(
+        "failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE",
+    )?;
 
     let ring_buf =
         tokio::io::unix::AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
 
-    let (tx, rx) = mpsc::channel::<PacketSummary>(1024);
+    let (packet_tx, packet_rx) = mpsc::channel::<CapturedPacket>(1024);
 
-    let printer_handle = task::spawn(async move {
-        let mut table = PacketTable::new();
-        let mut rx = rx;
-        while let Some(summary) = rx.recv().await {
-            table.push(summary);
-        }
-        table.flush();
-        Ok::<(), anyhow::Error>(())
-    });
-
-    let reader = {
-        let tx = tx.clone();
+    let reader_handle: task::JoinHandle<Result<(), anyhow::Error>> = {
+        let tx = packet_tx.clone();
         task::spawn(async move {
             let mut ring_buf = ring_buf;
-            let mut parsed_packets = Vec::new();
 
-            'reader: loop {
-                let mut guard = ring_buf.readable_mut().await?;
+            loop {
+                let mut guard = match ring_buf.readable_mut().await {
+                    Ok(g) => g,
+                    Err(err) => return Err(err.into()),
+                };
                 {
                     let ring_buf = guard.get_inner_mut();
                     while let Some(event) = ring_buf.next() {
@@ -103,50 +100,413 @@ async fn main() -> anyhow::Result<()> {
                             let payload = packet.payload();
                             debug!("raw packet: {:02x?}", payload);
                             match describe_packet(payload) {
-                                Ok(summary) => parsed_packets.push(summary),
+                                Ok(parsed) => {
+                                    if tx.send(parsed).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
                                 Err(err) => {
-                                    warn!(
-                                        "failed to analyze packet (len={}): {err}",
-                                        payload.len()
-                                    );
+                                    warn!("failed to analyze packet (len={}): {err}", payload.len())
                                 }
                             }
                         }
                     }
                 }
                 guard.clear_ready();
-
-                for summary in parsed_packets.drain(..) {
-                    if tx.send(summary).await.is_err() {
-                        break 'reader;
-                    }
-                }
             }
-
-            Ok::<(), anyhow::Error>(())
         })
     };
+    drop(packet_tx);
 
-    signal::ctrl_c().await?;
-    println!("Exiting...");
-    reader.abort();
-    drop(tx);
+    let mut terminal = setup_terminal()?;
+    let input_rx = spawn_input_listener();
+    let app_result = run_app(&mut terminal, packet_rx, input_rx).await;
+    restore_terminal(&mut terminal)?;
 
-    match reader.await {
-        Err(err) if !err.is_cancelled() => warn!("packet reader task failed: {err}"),
-        _ => {}
+    reader_handle.abort();
+    if let Err(err) = reader_handle.await
+        && !err.is_cancelled()
+    {
+        warn!("packet reader task failed: {err}");
     }
 
-    match printer_handle.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!("table printer task failed: {err}"),
-        Err(err) => warn!("table printer task join failed: {err}"),
+    app_result
+}
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+    Ok(terminal)
+}
+
+fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    terminal.show_cursor()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+    Ok(())
+}
+
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    mut packet_rx: mpsc::Receiver<CapturedPacket>,
+    mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
+) -> Result<()> {
+    let mut app = App::new();
+    let mut ctrl_c = Box::pin(signal::ctrl_c());
+    let mut packets_closed = false;
+    let mut input_closed = false;
+
+    loop {
+        terminal.draw(|frame| draw(frame, &app))?;
+
+        if packets_closed && input_closed {
+            break;
+        }
+
+        tokio::select! {
+            _ = &mut ctrl_c => break,
+            maybe_packet = packet_rx.recv(), if !packets_closed => match maybe_packet {
+                Some(packet) => app.on_packet(packet),
+                None => packets_closed = true,
+            },
+            maybe_event = input_rx.recv(), if !input_closed => match maybe_event {
+                Some(event) => {
+                    if app.handle_input(event) {
+                        break;
+                    }
+                }
+                None => input_closed = true,
+            },
+        }
     }
 
     Ok(())
 }
 
-fn describe_packet(bytes: &[u8]) -> Result<PacketSummary, &'static str> {
+fn draw(frame: &mut Frame<'_>, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+        ])
+        .split(frame.size());
+
+    draw_summary(frame, chunks[0], app);
+    draw_details(frame, chunks[1], app);
+    draw_payload(frame, chunks[2], app);
+}
+
+fn draw_summary(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    let view_capacity = area.height.saturating_sub(3).max(1) as usize;
+    let start = app.summary_start(view_capacity);
+    let rows: Vec<Row> = app
+        .packets
+        .iter()
+        .enumerate()
+        .skip(start)
+        .map(|(idx, packet)| {
+            let summary = &packet.summary;
+            Row::new(vec![
+                TuiCell::from(summary.cached_time.clone()),
+                TuiCell::from(summary.source.clone()),
+                TuiCell::from(summary.destination.clone()),
+                TuiCell::from(summary.protocol.clone()),
+                TuiCell::from(summary.length.to_string()),
+                TuiCell::from(summary.info.clone()),
+            ])
+            .style(if Some(idx) == app.selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            })
+        })
+        .collect();
+
+    let header = Row::new(vec![
+        TuiCell::from("Time"),
+        TuiCell::from("Source"),
+        TuiCell::from("Destination"),
+        TuiCell::from("Protocol"),
+        TuiCell::from("Length"),
+        TuiCell::from("Info"),
+    ]);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(12),
+            Constraint::Length(18),
+            Constraint::Length(18),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Min(10),
+        ],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title("Packets"))
+    .highlight_style(
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("▶ ");
+
+    let mut table_state = TableState::default();
+    if let Some(selected) = app.selected
+        && selected >= start
+    {
+        table_state.select(Some(selected - start));
+    }
+
+    frame.render_stateful_widget(table, area, &mut table_state);
+}
+
+fn draw_details(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    let lines: Vec<Line> = match app.current_packet() {
+        Some(packet) => packet
+            .details
+            .iter()
+            .map(|entry| {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<12}", entry.label),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(entry.value.clone()),
+                ])
+            })
+            .collect(),
+        None => vec![Line::from("Waiting for packets...")],
+    };
+
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Details"))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_payload(frame: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
+    let dump = match app.current_packet() {
+        Some(packet) => format_hexdump(&packet.raw),
+        None => String::from(""),
+    };
+
+    let paragraph = Paragraph::new(dump)
+        .block(Block::default().borders(Borders::ALL).title("Raw Bytes"))
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, area);
+}
+
+fn format_hexdump(data: &[u8]) -> String {
+    if data.is_empty() {
+        return String::from("<empty>");
+    }
+    let mut output = String::new();
+    for (index, chunk) in data.chunks(16).enumerate() {
+        let offset = index * 16;
+        let _ = write!(output, "{offset:04x}  ");
+        for i in 0..16 {
+            if let Some(byte) = chunk.get(i) {
+                let _ = write!(output, "{:02x} ", byte);
+            } else {
+                output.push_str("   ");
+            }
+            if i == 7 {
+                output.push(' ');
+            }
+        }
+        output.push(' ');
+        for byte in chunk {
+            let ch = if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            };
+            output.push(ch);
+        }
+        output.push('\n');
+    }
+    output
+}
+
+fn spawn_input_listener() -> mpsc::UnboundedReceiver<InputEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        loop {
+            if tx.is_closed() {
+                break;
+            }
+            if event::poll(Duration::from_millis(200)).unwrap_or(false) {
+                match event::read() {
+                    Ok(CEvent::Key(key)) => {
+                        if tx.send(InputEvent::Key(key)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(CEvent::Resize(_, _)) => {
+                        let _ = tx.send(InputEvent::Resize);
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    rx
+}
+
+struct App {
+    packets: Vec<CapturedPacket>,
+    selected: Option<usize>,
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            packets: Vec::new(),
+            selected: None,
+        }
+    }
+
+    fn on_packet(&mut self, packet: CapturedPacket) {
+        const MAX_PACKETS: usize = 512;
+        let follow_tail = self
+            .selected
+            .map(|idx| idx + 1 == self.packets.len())
+            .unwrap_or(true);
+
+        self.packets.push(packet);
+
+        if self.packets.len() > MAX_PACKETS {
+            self.packets.remove(0);
+            if let Some(idx) = self.selected {
+                self.selected = Some(idx.saturating_sub(1));
+            }
+        }
+
+        if self.packets.is_empty() {
+            self.selected = None;
+        } else if follow_tail || self.selected.is_none() {
+            self.selected = Some(self.packets.len() - 1);
+        } else if let Some(idx) = self.selected
+            && idx >= self.packets.len()
+        {
+            self.selected = Some(self.packets.len() - 1);
+        }
+    }
+
+    fn handle_input(&mut self, event: InputEvent) -> bool {
+        match event {
+            InputEvent::Key(KeyEvent { code, .. }) => match code {
+                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return true,
+                KeyCode::Up => self.select_prev(1),
+                KeyCode::Down => self.select_next(1),
+                KeyCode::PageUp => self.select_prev(10),
+                KeyCode::PageDown => self.select_next(10),
+                KeyCode::Home => self.select_first(),
+                KeyCode::End => self.select_last(),
+                _ => {}
+            },
+            InputEvent::Resize => {}
+        }
+        false
+    }
+
+    fn select_prev(&mut self, count: usize) {
+        if self.packets.is_empty() {
+            return;
+        }
+        let current = self.selected.unwrap_or(0);
+        let new = current.saturating_sub(count);
+        self.selected = Some(new);
+    }
+
+    fn select_next(&mut self, count: usize) {
+        if self.packets.is_empty() {
+            return;
+        }
+        let current = self
+            .selected
+            .unwrap_or_else(|| self.packets.len().saturating_sub(1));
+        let new = (current + count).min(self.packets.len().saturating_sub(1));
+        self.selected = Some(new);
+    }
+
+    fn select_first(&mut self) {
+        if self.packets.is_empty() {
+            return;
+        }
+        self.selected = Some(0);
+    }
+
+    fn select_last(&mut self) {
+        if self.packets.is_empty() {
+            return;
+        }
+        self.selected = Some(self.packets.len() - 1);
+    }
+
+    fn current_packet(&self) -> Option<&CapturedPacket> {
+        self.selected.and_then(|idx| self.packets.get(idx))
+    }
+
+    fn summary_start(&self, capacity: usize) -> usize {
+        if self.packets.len() <= capacity {
+            return 0;
+        }
+        let selected = self
+            .selected
+            .unwrap_or_else(|| self.packets.len().saturating_sub(1));
+        if selected < capacity {
+            0
+        } else {
+            selected + 1 - capacity
+        }
+    }
+}
+
+enum InputEvent {
+    Key(KeyEvent),
+    Resize,
+}
+
+struct CapturedPacket {
+    summary: SummaryRow,
+    details: Vec<DetailEntry>,
+    raw: Vec<u8>,
+}
+
+struct SummaryRow {
+    source: String,
+    destination: String,
+    protocol: String,
+    length: usize,
+    info: String,
+    cached_time: String,
+}
+
+struct DetailEntry {
+    label: &'static str,
+    value: String,
+}
+
+impl DetailEntry {
+    fn new(label: &'static str, value: String) -> Self {
+        Self { label, value }
+    }
+}
+
+fn describe_packet(bytes: &[u8]) -> Result<CapturedPacket, &'static str> {
     const ETH_HEADER_LEN: usize = 14;
 
     if bytes.len() < ETH_HEADER_LEN {
@@ -160,20 +520,36 @@ fn describe_packet(bytes: &[u8]) -> Result<PacketSummary, &'static str> {
     let ethertype = u16::from_be_bytes([bytes[12], bytes[13]]);
     let frame_len = bytes.len();
 
+    let timestamp = SystemTime::now();
+    let cached_time = format_cached_time(timestamp);
+    let mut details = vec![
+        DetailEntry::new("Timestamp", cached_time.clone()),
+        DetailEntry::new("Frame", format!("{frame_len} bytes")),
+        DetailEntry::new(
+            "Ethernet",
+            format!(
+                "{} -> {} type=0x{:04x}",
+                MacAddr(src_mac),
+                MacAddr(dst_mac),
+                ethertype
+            ),
+        ),
+    ];
+
+    let mut summary = SummaryRow {
+        source: MacAddr(src_mac).to_string(),
+        destination: MacAddr(dst_mac).to_string(),
+        protocol: format!("0x{:04x}", ethertype),
+        length: frame_len,
+        info: format!("ethertype=0x{:04x}", ethertype),
+        cached_time,
+    };
+
     if ethertype != 0x0800 {
-        return Ok(PacketSummary {
-            timestamp: SystemTime::now(),
-            src_mac: MacAddr(src_mac),
-            dst_mac: MacAddr(dst_mac),
-            ethertype,
-            proto: PacketProtocol::Other { value: ethertype },
-            src_addr: PacketAddr::None,
-            dst_addr: PacketAddr::None,
-            src_port: None,
-            dst_port: None,
-            tcp_flags: None,
-            frame_len,
-            payload_len: 0,
+        return Ok(CapturedPacket {
+            summary,
+            details,
+            raw: bytes.to_vec(),
         });
     }
 
@@ -201,20 +577,28 @@ fn describe_packet(bytes: &[u8]) -> Result<PacketSummary, &'static str> {
     let src_ip = Ipv4Addr::new(ip_bytes[12], ip_bytes[13], ip_bytes[14], ip_bytes[15]);
     let dst_ip = Ipv4Addr::new(ip_bytes[16], ip_bytes[17], ip_bytes[18], ip_bytes[19]);
 
+    summary.source = src_ip.to_string();
+    summary.destination = dst_ip.to_string();
+    summary.protocol = if protocol == 6 {
+        "TCP".to_string()
+    } else {
+        format!("IPv4/{protocol}")
+    };
+
+    details.push(DetailEntry::new(
+        "IPv4",
+        format!(
+            "{} -> {} TTL={} TotalLen={}",
+            src_ip, dst_ip, ttl, total_length
+        ),
+    ));
+
     if protocol != 6 {
-        return Ok(PacketSummary {
-            timestamp: SystemTime::now(),
-            src_mac: MacAddr(src_mac),
-            dst_mac: MacAddr(dst_mac),
-            ethertype,
-            proto: PacketProtocol::Ipv4 { ttl, protocol },
-            src_addr: PacketAddr::Ipv4(src_ip),
-            dst_addr: PacketAddr::Ipv4(dst_ip),
-            src_port: None,
-            dst_port: None,
-            tcp_flags: None,
-            frame_len,
-            payload_len: total_length.saturating_sub(ihl),
+        summary.info = format!("proto={} ttl={} total_len={}", protocol, ttl, total_length);
+        return Ok(CapturedPacket {
+            summary,
+            details,
+            raw: bytes.to_vec(),
         });
     }
 
@@ -240,27 +624,35 @@ fn describe_packet(bytes: &[u8]) -> Result<PacketSummary, &'static str> {
     let window = u16::from_be_bytes([tcp_bytes[14], tcp_bytes[15]]);
     let payload_len = tcp_bytes.len().saturating_sub(data_offset);
 
-    Ok(PacketSummary {
-        timestamp: SystemTime::now(),
-        src_mac: MacAddr(src_mac),
-        dst_mac: MacAddr(dst_mac),
-        ethertype,
-        proto: PacketProtocol::Tcp {
-            ttl,
-            total_length,
-            seq,
-            ack,
-            window,
-            tcp_header_len: data_offset,
-        },
-        src_addr: PacketAddr::Ipv4(src_ip),
-        dst_addr: PacketAddr::Ipv4(dst_ip),
-        src_port: Some(src_port),
-        dst_port: Some(dst_port),
-        tcp_flags: Some(TcpFlags(flags)),
-        frame_len,
-        payload_len,
+    summary.info = format!(
+        "{} -> {} seq={} ack={} flags=[{}] len={}",
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        TcpFlags(flags),
+        payload_len
+    );
+
+    details.push(DetailEntry::new(
+        "TCP",
+        format!(
+            "{} -> {} Seq={} Ack={} Window={} Header={} Payload={}",
+            src_port, dst_port, seq, ack, window, data_offset, payload_len
+        ),
+    ));
+    details.push(DetailEntry::new("Flags", TcpFlags(flags).to_string()));
+
+    Ok(CapturedPacket {
+        summary,
+        details,
+        raw: bytes.to_vec(),
     })
+}
+
+fn format_cached_time(ts: SystemTime) -> String {
+    let datetime: DateTime<Local> = ts.into();
+    datetime.format("%H:%M:%S%.3f").to_string()
 }
 
 #[derive(Clone, Copy)]
@@ -310,172 +702,4 @@ impl fmt::Display for TcpFlags {
 
         Ok(())
     }
-}
-
-struct PacketTable {
-    table: Option<Table>,
-    rows_in_chunk: usize,
-    total_rows: usize,
-}
-
-impl PacketTable {
-    fn new() -> Self {
-        Self {
-            table: None,
-            rows_in_chunk: 0,
-            total_rows: 0,
-        }
-    }
-
-    fn push(&mut self, summary: PacketSummary) {
-        let table = self.table.get_or_insert_with(new_table);
-
-        table.add_row(summary.into_row());
-        self.rows_in_chunk += 1;
-        self.total_rows += 1;
-
-        if self.rows_in_chunk >= 25 {
-            println!("{}", table.trim_fmt());
-            *table = new_table();
-            self.rows_in_chunk = 0;
-        }
-    }
-
-    fn flush(mut self) {
-        match (self.table.take(), self.rows_in_chunk, self.total_rows) {
-            (Some(table), rows, _) if rows > 0 => println!("{}", table.trim_fmt()),
-            (_, _, total) if total == 0 => println!("No packets captured."),
-            _ => {}
-        }
-    }
-}
-
-struct PacketSummary {
-    timestamp: SystemTime,
-    src_mac: MacAddr,
-    dst_mac: MacAddr,
-    ethertype: u16,
-    proto: PacketProtocol,
-    src_addr: PacketAddr,
-    dst_addr: PacketAddr,
-    src_port: Option<u16>,
-    dst_port: Option<u16>,
-    tcp_flags: Option<TcpFlags>,
-    frame_len: usize,
-    payload_len: usize,
-}
-
-enum PacketProtocol {
-    Other {
-        value: u16,
-    },
-    Ipv4 {
-        ttl: u8,
-        protocol: u8,
-    },
-    Tcp {
-        ttl: u8,
-        total_length: usize,
-        seq: u32,
-        ack: u32,
-        window: u16,
-        tcp_header_len: usize,
-    },
-}
-
-enum PacketAddr {
-    None,
-    Ipv4(Ipv4Addr),
-}
-
-impl PacketSummary {
-    fn into_row(self) -> Vec<Cell> {
-        let timestamp = format_timestamp(self.timestamp);
-        let proto = format_protocol(&self.proto);
-        let src_addr = format_addr(&self.src_addr);
-        let dst_addr = format_addr(&self.dst_addr);
-        let src_port = format_port(self.src_port);
-        let dst_port = format_port(self.dst_port);
-        let tcp_flags = self
-            .tcp_flags
-            .map(|flags| flags.to_string())
-            .unwrap_or_else(|| "-".to_string());
-
-        vec![
-            Cell::new(timestamp),
-            Cell::new(self.src_mac.to_string()),
-            Cell::new(self.dst_mac.to_string()),
-            Cell::new(format!("0x{:04x}", self.ethertype)),
-            Cell::new(src_addr),
-            Cell::new(dst_addr),
-            Cell::new(proto),
-            Cell::new(src_port),
-            Cell::new(dst_port),
-            Cell::new(tcp_flags),
-            Cell::new(self.frame_len.to_string()),
-            Cell::new(format!("{}", self.payload_len)),
-        ]
-    }
-}
-
-fn new_table() -> Table {
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
-    table.set_header(vec![
-        Cell::new("Timestamp"),
-        Cell::new("Src MAC"),
-        Cell::new("Dst MAC"),
-        Cell::new("Ethertype"),
-        Cell::new("Src Addr"),
-        Cell::new("Dst Addr"),
-        Cell::new("Proto"),
-        Cell::new("Src Port"),
-        Cell::new("Dst Port"),
-        Cell::new("TCP Flags"),
-        Cell::new("Frame Len"),
-        Cell::new("Payload"),
-    ]);
-    table
-}
-
-fn format_timestamp(ts: SystemTime) -> String {
-    match ts.duration_since(UNIX_EPOCH) {
-        Ok(duration) => {
-            let secs = duration.as_secs();
-            let millis = duration.subsec_millis();
-            format!("{secs}.{millis:03}")
-        }
-        Err(_) => "-".to_string(),
-    }
-}
-
-fn format_protocol(proto: &PacketProtocol) -> String {
-    match proto {
-        PacketProtocol::Other { value } => format!("other(0x{:04x})", value),
-        PacketProtocol::Ipv4 { ttl, protocol } => {
-            format!("ipv4 ttl={ttl} proto={protocol}")
-        }
-        PacketProtocol::Tcp {
-            ttl,
-            total_length,
-            seq,
-            ack,
-            window,
-            tcp_header_len,
-        } => format!(
-            "tcp ttl={ttl} len={total_length} seq={seq} ack={ack} win={window} hdr={tcp_header_len}"
-        ),
-    }
-}
-
-fn format_addr(addr: &PacketAddr) -> String {
-    match addr {
-        PacketAddr::None => "-".to_string(),
-        PacketAddr::Ipv4(ip) => ip.to_string(),
-    }
-}
-
-fn format_port(port: Option<u16>) -> String {
-    port.map(|p| p.to_string())
-        .unwrap_or_else(|| "-".to_string())
 }
