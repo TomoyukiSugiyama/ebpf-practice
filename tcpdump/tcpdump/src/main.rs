@@ -4,7 +4,7 @@ use aya::programs::{Xdp, XdpFlags};
 use chrono::{DateTime, Local};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode, KeyEvent},
+    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -407,16 +407,26 @@ impl App {
 
     fn handle_input(&mut self, event: InputEvent) -> bool {
         match event {
-            InputEvent::Key(KeyEvent { code, .. }) => match code {
-                KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return true,
-                KeyCode::Up => self.select_prev(1),
-                KeyCode::Down => self.select_next(1),
-                KeyCode::PageUp => self.select_prev(10),
-                KeyCode::PageDown => self.select_next(10),
-                KeyCode::Home => self.select_first(),
-                KeyCode::End => self.select_last(),
-                _ => {}
-            },
+            InputEvent::Key(KeyEvent {
+                code, modifiers, ..
+            }) => {
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(code, KeyCode::Char('c') | KeyCode::Char('C'))
+                {
+                    return true;
+                }
+
+                match code {
+                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => return true,
+                    KeyCode::Up => self.select_prev(1),
+                    KeyCode::Down => self.select_next(1),
+                    KeyCode::PageUp => self.select_prev(10),
+                    KeyCode::PageDown => self.select_next(10),
+                    KeyCode::Home => self.select_first(),
+                    KeyCode::End => self.select_last(),
+                    _ => {}
+                }
+            }
             InputEvent::Resize => {}
         }
         false
